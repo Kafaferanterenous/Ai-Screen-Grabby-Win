@@ -1,0 +1,8 @@
+Ai Screen Grabby portable includes a Python runtime and a Tk user interface packaged with PyInstaller.
+
+The package includes the following upstream license texts in the licenses folder:
+- Python-LICENSE.txt: Python Software Foundation and included Python components.
+- Tk-license.terms: Tcl/Tk terms distributed with the runtime.
+- PyInstaller-COPYING.txt: PyInstaller terms, including its bootloader exception.
+
+The screenshots in the source repository and portable package show synthetic window data only.

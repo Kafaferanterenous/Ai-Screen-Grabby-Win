@@ -1,0 +1,7 @@
+__pycache__/
+captures/
+*.png
+!assets/*.png
+build_portable/
+portable_app/
+Ai-Screen-Grabby-*-portable.zip
