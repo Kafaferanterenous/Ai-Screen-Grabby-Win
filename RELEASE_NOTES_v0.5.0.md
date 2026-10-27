@@ -26,3 +26,5 @@ Grabby uses Windows `PrintWindow`. It can capture a covered window. It briefly r
 Five automated checks passed. The GUI, settings themes, title-based targeting, and portable MCP/CLI capture were checked locally with synthetic windows. Live behavior with every third-party app is unverified.
 
 Grabby source is available under the MIT License. The portable ZIP includes the app license and third-party runtime notices.
+
+Portable ZIP SHA-256: `761b513e65e957973632a57adfe7f0b617a27e825891cac34ffb5b53973d27cd`
