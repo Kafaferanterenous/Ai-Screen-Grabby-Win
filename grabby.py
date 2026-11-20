@@ -20,7 +20,10 @@ from typing import Optional
 import zlib
 
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
+MAX_DELAY_SECONDS = 600
+PW_RENDERFULLCONTENT = 0x2  # include DirectComposition/GPU content (Windows 8.1+)
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
 PROTOCOL_VERSION = "2025-06-18"
 APP_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DEFAULT_DIR = APP_ROOT / "captures"
@@ -136,6 +139,8 @@ if sys.platform == "win32":
     gdi32 = C.WinDLL("gdi32", use_last_error=True)
     WNDENUMPROC = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
 
+    dwmapi = C.WinDLL("dwmapi", use_last_error=True)
+
     class RECT(C.Structure):
         _fields_ = [("left", W.LONG), ("top", W.LONG), ("right", W.LONG), ("bottom", W.LONG)]
 
@@ -180,6 +185,12 @@ if sys.platform == "win32":
     user32.ReleaseDC.restype = C.c_int
     user32.PrintWindow.argtypes = [W.HWND, W.HDC, W.UINT]
     user32.PrintWindow.restype = W.BOOL
+    user32.GetClientRect.argtypes = [W.HWND, C.POINTER(RECT)]
+    user32.GetClientRect.restype = W.BOOL
+    user32.ClientToScreen.argtypes = [W.HWND, C.POINTER(W.POINT)]
+    user32.ClientToScreen.restype = W.BOOL
+    dwmapi.DwmGetWindowAttribute.argtypes = [W.HWND, W.DWORD, C.c_void_p, W.DWORD]
+    dwmapi.DwmGetWindowAttribute.restype = C.c_long
     gdi32.CreateCompatibleDC.argtypes = [W.HDC]
     gdi32.CreateCompatibleDC.restype = W.HDC
     gdi32.DeleteDC.argtypes = [W.HDC]
@@ -190,6 +201,27 @@ if sys.platform == "win32":
     gdi32.SelectObject.restype = W.HGDIOBJ
     gdi32.DeleteObject.argtypes = [W.HGDIOBJ]
     gdi32.DeleteObject.restype = W.BOOL
+
+
+def enable_dpi_awareness() -> str:
+    """Use real pixels on scaled (125%/150%) displays; otherwise Windows reports
+    virtualised window sizes and captures come out cropped or blurry."""
+    if sys.platform != "win32":
+        return "n/a"
+    try:
+        fn = user32.SetProcessDpiAwarenessContext
+        fn.argtypes = [C.c_void_p]
+        fn.restype = W.BOOL
+        if fn(C.c_void_p(-4)):  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+            return "per-monitor-v2"
+    except AttributeError:
+        pass
+    try:
+        if C.WinDLL("shcore").SetProcessDpiAwareness(2) == 0:  # PROCESS_PER_MONITOR_DPI_AWARE
+            return "per-monitor"
+    except (AttributeError, OSError):
+        pass
+    return "system" if user32.SetProcessDPIAware() else "unaware"
 
 
 def _title(hwnd: int) -> str:
@@ -215,7 +247,8 @@ def _window(hwnd: int) -> dict:
             rect = placement.rcNormalPosition
     return {"hwnd": hwnd, "pid": pid.value, "title": _title(hwnd),
             "visible": bool(user32.IsWindowVisible(hwnd)), "minimized": minimized,
-            "width": rect.right - rect.left, "height": rect.bottom - rect.top}
+            "width": rect.right - rect.left, "height": rect.bottom - rect.top,
+            "left": rect.left, "top": rect.top}
 
 
 def list_windows() -> list[dict]:
@@ -262,18 +295,80 @@ def _chunk(kind: bytes, data: bytes) -> bytes:
 
 def _png(width: int, height: int, bgra: bytes) -> bytes:
     # DIB is top-down BGRA. PNG color type 2 is RGB; alpha is not meaningful for PrintWindow.
-    rows = bytearray()
+    # Channel shuffling uses slice assignment (C speed) instead of a per-pixel loop.
     stride = width * 4
+    rows = bytearray((width * 3 + 1) * height)
+    view = memoryview(rows)
     for y in range(height):
-        rows.append(0)
         row = bgra[y * stride:(y + 1) * stride]
-        for x in range(0, stride, 4):
-            rows.extend((row[x + 2], row[x + 1], row[x]))
+        start = y * (width * 3 + 1) + 1
+        rgb = view[start:start + width * 3]
+        rgb[0::3] = row[2::4]
+        rgb[1::3] = row[1::4]
+        rgb[2::3] = row[0::4]
     return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", struct.pack("!2I5B", width, height, 8, 2, 0, 0, 0))
             + _chunk(b"IDAT", zlib.compress(rows, 6)) + _chunk(b"IEND", b""))
 
 
-def capture(hwnd: int, expected_pid: int, output_path: str, overwrite: bool = False) -> dict:
+def _crop(bgra: bytes, width: int, height: int, left: int, top: int, right: int, bottom: int) -> bytes:
+    """Cut a BGRA buffer to the box [left, right) x [top, bottom)."""
+    if not (0 <= left < right <= width and 0 <= top < bottom <= height):
+        raise ValueError("Crop box is outside the image")
+    if (left, top, right, bottom) == (0, 0, width, height):
+        return bgra
+    stride = width * 4
+    return b"".join(bgra[y * stride + left * 4:y * stride + right * 4] for y in range(top, bottom))
+
+
+def _is_blank(bgra: bytes, width: int, height: int, samples: int = 20000) -> bool:
+    """True when every sampled pixel has the same colour (typical of an unrenderable window)."""
+    total = width * height
+    if total == 0:
+        return True
+    step = max(1, total // samples)
+    first = bgra[0:3]
+    return all(bgra[i * 4:i * 4 + 3] == first for i in range(0, total, step))
+
+
+def _visible_box(hwnd: int, item: dict, client_only: bool) -> tuple:
+    """Box (relative to the window rectangle) that is actually visible: without the
+    invisible resize borders, or only the client area when requested."""
+    width, height = item["width"], item["height"]
+    box = RECT()
+    if client_only:
+        if not user32.GetClientRect(hwnd, C.byref(box)):
+            return 0, 0, width, height
+        origin = W.POINT(0, 0)
+        user32.ClientToScreen(hwnd, C.byref(origin))
+        left, top = origin.x - item["left"], origin.y - item["top"]
+        right, bottom = left + box.right, top + box.bottom
+    elif dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, C.byref(box), C.sizeof(box)) == 0:
+        left, top = box.left - item["left"], box.top - item["top"]
+        right, bottom = box.right - item["left"], box.bottom - item["top"]
+    else:
+        return 0, 0, width, height
+    left, top = max(0, left), max(0, top)
+    right, bottom = min(width, right), min(height, bottom)
+    if right - left < 1 or bottom - top < 1:
+        return 0, 0, width, height
+    return left, top, right, bottom
+
+
+def wait_with_countdown(seconds: float, announce: bool = False) -> None:
+    """Delay before capturing (to reach a menu, a hover state, a later screen...)."""
+    if not 0 <= seconds <= MAX_DELAY_SECONDS:
+        raise ValueError(f"Delay must be between 0 and {MAX_DELAY_SECONDS} seconds")
+    end = time.monotonic() + seconds
+    while (remaining := end - time.monotonic()) > 0:
+        if announce:
+            print(f"\rCapturing in {remaining:4.0f} s ", end="", file=sys.stderr, flush=True)
+        time.sleep(min(1.0, remaining))
+    if announce and seconds:
+        print("\rCapturing now.       ", file=sys.stderr, flush=True)
+
+
+def capture(hwnd: int, expected_pid: int, output_path: str, overwrite: bool = False,
+            client_only: bool = False) -> dict:
     if sys.platform != "win32":
         raise RuntimeError("Windows is required")
     item = _window(hwnd)
@@ -292,7 +387,7 @@ def capture(hwnd: int, expected_pid: int, output_path: str, overwrite: bool = Fa
                 raise RuntimeError("The target could not be restored without activating it")
         if item["pid"] != expected_pid:
             raise ValueError("Window PID changed; list windows again")
-        return _capture_rendered(hwnd, expected_pid, path, overwrite, item, initially_minimized)
+        return _capture_rendered(hwnd, expected_pid, path, overwrite, item, initially_minimized, client_only)
     finally:
         if initially_minimized and user32.IsWindow(hwnd):
             try:
@@ -314,7 +409,7 @@ def _validated_output_path(output_path: str, overwrite: bool) -> Path:
 
 
 def _capture_rendered(hwnd: int, expected_pid: int, path: Path, overwrite: bool, item: dict,
-                      initially_minimized: bool) -> dict:
+                      initially_minimized: bool, client_only: bool = False) -> dict:
     width, height = item["width"], item["height"]
     if not (1 <= width <= 16384 and 1 <= height <= 16384 and width * height <= 30_000_000):
         raise ValueError("Window dimensions exceed capture limits")
@@ -341,9 +436,17 @@ def _capture_rendered(hwnd: int, expected_pid: int, path: Path, overwrite: bool,
         old = gdi32.SelectObject(memory, bitmap)
         if not old:
             raise OSError(C.get_last_error(), "SelectObject failed")
-        if not user32.PrintWindow(hwnd, memory, 0):
-            raise RuntimeError("PrintWindow failed; this window may not support window rendering")
-        png = _png(width, height, C.string_at(pixels, width * height * 4))
+        method = "full-content"
+        if not user32.PrintWindow(hwnd, memory, PW_RENDERFULLCONTENT):
+            method = "legacy"  # older Windows or an app that refuses the full-content path
+            if not user32.PrintWindow(hwnd, memory, 0):
+                raise RuntimeError("PrintWindow failed; this window may not support window rendering")
+        raw = C.string_at(pixels, width * height * 4)
+        box = _visible_box(hwnd, item, client_only)
+        raw = _crop(raw, width, height, *box)
+        out_w, out_h = box[2] - box[0], box[3] - box[1]
+        blank = _is_blank(raw, out_w, out_h)
+        png = _png(out_w, out_h, raw)
     finally:
         if old and memory:
             gdi32.SelectObject(memory, old)
@@ -355,11 +458,16 @@ def _capture_rendered(hwnd: int, expected_pid: int, path: Path, overwrite: bool,
     flags = "wb" if overwrite else "xb"
     with path.open(flags) as file:
         file.write(png)
-    return {"path": str(path), "format": "png", "width": width, "height": height,
-            "sha256": hashlib.sha256(png).hexdigest(), "bytes": len(png),
-            "window": {"hwnd": hwnd, "pid": expected_pid, "title": item["title"]},
-            "temporarily_restored": initially_minimized,
-            "warning": "Some GPU-rendered and protected windows may yield blank or incomplete pixels; inspect the PNG."}
+    result = {"path": str(path), "format": "png", "width": out_w, "height": out_h,
+              "sha256": hashlib.sha256(png).hexdigest(), "bytes": len(png),
+              "window": {"hwnd": hwnd, "pid": expected_pid, "title": item["title"]},
+              "method": method, "area": "client" if client_only else "window",
+              "blank": blank, "temporarily_restored": initially_minimized}
+    if blank:
+        result["warning"] = ("The image is a single colour: this window could not be rendered "
+                             "(protected/DRM content, or a window that is still loading). "
+                             "Try again with a delay, or with the window visible.")
+    return result
 
 
 TOOLS = [
@@ -367,13 +475,15 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "set_output_directory", "description": "Set the local directory used for subsequent captures by the GUI, CLI, and MCP tools.",
      "inputSchema": {"type": "object", "properties": {"directory": {"type": "string", "description": "Absolute local directory"}}, "required": ["directory"]}},
-    {"name": "capture_window", "description": "Capture one listed window to a local PNG, including a covered window. A minimized window is briefly restored without activation and re-minimized. Uses PrintWindow. Omit output_path to use the configured directory. No automatic screen fallback.",
+    {"name": "capture_window", "description": "Capture one listed window to a local PNG, including a covered window. A minimized window is briefly restored without activation and re-minimized. Uses PrintWindow with full-content rendering (works for browser/WebView2/Electron/GPU apps). The result says blank=true if the window could not be rendered. Omit output_path to use the configured directory. Never captures other windows or the desktop.",
      "inputSchema": {"type": "object", "properties": {
          "hwnd": {"type": "integer", "description": "Window handle from list_windows"},
          "pid": {"type": "integer", "description": "Process ID from list_windows, checked to avoid a stale handle"},
          "output_path": {"type": "string", "description": "Optional absolute PNG path, including requested filename"},
          "overwrite": {"type": "boolean", "default": False},
-         "include_image": {"type": "boolean", "default": False, "description": "Also return the PNG as MCP image content"}},
+         "include_image": {"type": "boolean", "default": False, "description": "Also return the PNG as MCP image content"},
+         "delay_seconds": {"type": "number", "minimum": 0, "maximum": 600, "default": 0, "description": "Wait this long before capturing (e.g. to let a page load or a menu open)"},
+         "client_area": {"type": "boolean", "default": False, "description": "Capture only the window content, without title bar and borders"}},
          "required": ["hwnd", "pid"]}},
     {"name": "capture_window_by_title", "description": "Capture one window by all or part of its title. Matching ignores case and refuses ambiguous results. A minimized window is briefly restored without activation and re-minimized.",
      "inputSchema": {"type": "object", "properties": {
@@ -382,7 +492,9 @@ TOOLS = [
          "pid": {"type": "integer", "description": "Optional process ID to disambiguate matches"},
          "output_path": {"type": "string", "description": "Optional absolute PNG path"},
          "overwrite": {"type": "boolean", "default": False},
-         "include_image": {"type": "boolean", "default": False}},
+         "include_image": {"type": "boolean", "default": False},
+         "delay_seconds": {"type": "number", "minimum": 0, "maximum": 600, "default": 0},
+         "client_area": {"type": "boolean", "default": False}},
          "required": ["title"]}},
 ]
 
@@ -393,13 +505,20 @@ def _mcp_capture(arguments: dict) -> dict:
     before = _window(hwnd)
     if before["pid"] != pid:
         raise ValueError("Window PID changed; list windows again")
+    delay = float(arguments.get("delay_seconds") or 0)
+    if not 0 <= delay <= MAX_DELAY_SECONDS:
+        raise ValueError(f"delay_seconds must be between 0 and {MAX_DELAY_SECONDS}")
     argv = cli_command("capture", "--hwnd", str(arguments["hwnd"]),
                        "--pid", str(arguments["pid"]), "--output",
-                       str(arguments.get("output_path") or default_output_path(int(arguments["hwnd"]))))
+                       str(arguments.get("output_path") or default_output_path(int(arguments["hwnd"]))),
+                       "--delay", str(delay))
     if arguments.get("overwrite"):
         argv.append("--overwrite")
+    if arguments.get("client_area"):
+        argv.append("--client")
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False)
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=10 + delay, check=False)
     except subprocess.TimeoutExpired as exc:
         if before["minimized"] and sys.platform == "win32" and user32.IsWindow(hwnd):
             try:
@@ -407,7 +526,7 @@ def _mcp_capture(arguments: dict) -> dict:
                     user32.ShowWindow(hwnd, 7)
             except (ValueError, OSError):
                 pass
-        raise RuntimeError("Capture timed out after 10 seconds") from exc
+        raise RuntimeError(f"Capture timed out after {10 + delay:.0f} seconds") from exc
     if proc.returncode:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "Capture failed")
     info = json.loads(proc.stdout)
@@ -464,8 +583,31 @@ def mcp_server() -> None:
         sys.stdout.flush()
 
 
+def utf8_stdio(*streams) -> None:
+    """Window titles can contain any Unicode (emoji, accents). When stdout is a
+    pipe, Windows defaults to the legacy code page and printing such a title
+    crashes ('charmap' codec). Always speak UTF-8 on stdout/stderr."""
+    for stream in streams or (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Capture a selected Windows window to a local PNG")
+    utf8_stdio()
+    parser = argparse.ArgumentParser(
+        description=f"Ai Screen Grabby {VERSION}: capture one chosen window to a local PNG (no screen, no upload).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples (people and AI tools):
+  Grabby.exe                                          open the window (GUI); press F1 there for shortcut keys
+  Grabby.exe list                                     list windows as JSON (title, PID, HWND, size)
+  Grabby.exe capture-title --title "Notepad"          capture a window whose title contains "Notepad"
+  Grabby.exe capture-title --title "Editor" --delay 5 wait 5 seconds first (open a menu, let a page load)
+  Grabby.exe capture --hwnd 1234 --pid 5678 --client  only the window content, no title bar
+  Grabby.exe mcp                                      MCP stdio server for AI clients
+
+The JSON result includes "blank": true when the window could not be rendered.""")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("gui", help="Open the local user interface")
     sub.add_parser("list", help="List visible windows as JSON")
@@ -477,13 +619,18 @@ def main() -> int:
     grab.add_argument("--pid", type=int, required=True)
     grab.add_argument("--output")
     grab.add_argument("--overwrite", action="store_true")
+    grab.add_argument("--delay", type=float, default=0, help=f"seconds to wait before capturing (0-{MAX_DELAY_SECONDS})")
+    grab.add_argument("--client", action="store_true", help="capture only the window content (no title bar/borders)")
     by_title = sub.add_parser("capture-title", help="Capture a unique window by its title")
     by_title.add_argument("--title", required=True)
     by_title.add_argument("--match", choices=("exact", "contains"), default="contains")
     by_title.add_argument("--pid", type=int)
     by_title.add_argument("--output")
     by_title.add_argument("--overwrite", action="store_true")
+    by_title.add_argument("--delay", type=float, default=0, help=f"seconds to wait before capturing (0-{MAX_DELAY_SECONDS})")
+    by_title.add_argument("--client", action="store_true", help="capture only the window content (no title bar/borders)")
     args = parser.parse_args()
+    enable_dpi_awareness()
     if args.command in (None, "gui"):
         from grabby_gui import GrabbyApp
         GrabbyApp().run()
@@ -497,10 +644,14 @@ def main() -> int:
         elif args.command == "settings":
             result = set_output_directory(args.output_directory) if args.output_directory else load_settings()
         elif args.command == "capture-title":
-            target = resolve_window_title(args.title, args.match, args.pid)
-            result = capture(target["hwnd"], target["pid"], args.output or default_output_path(target["hwnd"]), args.overwrite)
+            target = resolve_window_title(args.title, args.match, args.pid)  # fail fast before waiting
+            wait_with_countdown(args.delay, announce=sys.stderr.isatty())
+            result = capture(target["hwnd"], target["pid"], args.output or default_output_path(target["hwnd"]),
+                             args.overwrite, args.client)
         else:
-            result = capture(args.hwnd, args.pid, args.output or default_output_path(args.hwnd), args.overwrite)
+            wait_with_countdown(args.delay, announce=sys.stderr.isatty())
+            result = capture(args.hwnd, args.pid, args.output or default_output_path(args.hwnd), args.overwrite,
+                             args.client)
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except Exception as exc:

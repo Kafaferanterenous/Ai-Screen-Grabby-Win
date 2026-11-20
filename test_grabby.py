@@ -103,3 +103,79 @@ class McpTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class V060Tests(unittest.TestCase):
+    """Tests for the 0.6.0 additions (full-content capture helpers, delay, MCP schema)."""
+
+    def test_png_matches_reference_encoder(self):
+        # 3x2 BGRA image; compare the fast encoder against a straightforward one.
+        bgra = bytes(range(24))
+        rows = bytearray()
+        for y in range(2):
+            rows.append(0)
+            for x in range(3):
+                b, g, r = bgra[(y * 3 + x) * 4:(y * 3 + x) * 4 + 3]
+                rows.extend((r, g, b))
+        import zlib
+        png = grabby._png(3, 2, bgra)
+        idat_len = struct.unpack("!I", png[33:37])[0]
+        self.assertEqual(zlib.decompress(png[41:41 + idat_len]), bytes(rows))
+
+    def test_crop(self):
+        px = lambda v: bytes((v, v, v, 255))
+        img = b"".join(px(y * 10 + x) for y in range(3) for x in range(4))  # 4x3
+        out = grabby._crop(img, 4, 3, 1, 1, 3, 3)
+        self.assertEqual(out, px(11) + px(12) + px(21) + px(22))
+        self.assertEqual(grabby._crop(img, 4, 3, 0, 0, 4, 3), img)
+        with self.assertRaises(ValueError):
+            grabby._crop(img, 4, 3, 0, 0, 5, 3)
+
+    def test_blank_detection(self):
+        white = bytes((255, 255, 255, 0)) * 100
+        self.assertTrue(grabby._is_blank(white, 10, 10))
+        dot = bytearray(white)
+        dot[40:43] = b"\x00\x00\x00"
+        self.assertFalse(grabby._is_blank(bytes(dot), 10, 10))
+
+    def test_delay_bounds(self):
+        grabby.wait_with_countdown(0)
+        with self.assertRaises(ValueError):
+            grabby.wait_with_countdown(-1)
+        with self.assertRaises(ValueError):
+            grabby.wait_with_countdown(grabby.MAX_DELAY_SECONDS + 1)
+
+    def test_mcp_tools_offer_delay_and_client_area(self):
+        for name in ("capture_window", "capture_window_by_title"):
+            tool = next(t for t in grabby.TOOLS if t["name"] == name)
+            props = tool["inputSchema"]["properties"]
+            self.assertIn("delay_seconds", props)
+            self.assertIn("client_area", props)
+
+    def test_gui_help_lists_every_bound_shortcut(self):
+        import grabby_gui
+        keys = " ".join(k for k, _ in grabby_gui.SHORTCUTS)
+        for needed in ("F1", "Ctrl+D", "Ctrl+T", "Esc", "Ctrl+Q", "Enter"):
+            self.assertIn(needed, keys)
+
+
+class UnicodeOutputTests(unittest.TestCase):
+    def test_emoji_titles_survive_a_legacy_code_page_pipe(self):
+        import io
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="cp1252")
+        grabby.utf8_stdio(stream)
+        print(json.dumps([{"title": "Family \U0001f3e1 photos"}], ensure_ascii=False), file=stream)
+        stream.flush()
+        self.assertIn("\U0001f3e1", json.loads(raw.getvalue().decode("utf-8"))[0]["title"])
+
+    def test_cli_list_output_is_utf8_json(self):
+        if sys.platform != "win32":
+            self.skipTest("Windows only")
+        env = dict(os.environ)
+        env.pop("PYTHONIOENCODING", None)
+        env.pop("PYTHONUTF8", None)
+        proc = subprocess.run([sys.executable, str(Path(grabby.__file__)), "list"], capture_output=True,
+                              env=env, timeout=30, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+        self.assertIsInstance(json.loads(proc.stdout.decode("utf-8")), list)

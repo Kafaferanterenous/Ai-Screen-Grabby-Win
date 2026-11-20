@@ -14,6 +14,12 @@ The app uses a monospace font. `Screenshots\Grabby-Navy.png` shows the interface
 
 The two EXE files must stay in the same folder. This is a local portable app for Windows 10/11; it needs an interactive desktop session and does not need Python installed. Settings are stored in `%APPDATA%\Ai_Screen_Grabby\settings.json`. If you move the folder after enabling Windows startup, open Settings and save it again so the startup command uses the new location.
 
+## Shortcut keys
+
+Press **F1** in the window for the full list. F1 help, Ctrl+1/2/3 pages, Ctrl+F filter, Up/Down choose, Enter capture, Ctrl+D delay (none, 3, 5, 10, 15, 30, 60 s), Ctrl+T content only, Esc cancel countdown, F5 refresh, Ctrl+O open last PNG, Ctrl+E open save folder, Ctrl+Q exit.
+
+**Delay timer:** choose a delay, press Enter, then set up the window (open a menu, wait for a page). Grabby captures when the countdown ends.
+
 ## For AI tools
 
 `Grabby.exe` provides local commands:
@@ -22,11 +28,11 @@ The two EXE files must stay in the same folder. This is a local portable app for
 .\Grabby.exe list
 .\Grabby.exe settings --output-directory "C:\absolute\folder"
 .\Grabby.exe capture --hwnd HANDLE --pid PID
-.\Grabby.exe capture-title --title "part of window title"
+.\Grabby.exe capture-title --title "part of window title" [--delay 5] [--client]
 .\Grabby.exe mcp
 ```
 
-An AI client with local shell access can run the commands directly. To use MCP, register `Grabby.exe` as a local stdio server with `mcp` as its argument. No cloud connector or network listener is required by Grabby. MCP tools are `list_windows`, `set_output_directory`, `capture_window`, and `capture_window_by_title`. Title matching ignores case; if several windows match, Grabby refuses to guess and asks for an exact title, PID, or HWND. `output_path` is optional, and `include_image=true` also returns the PNG to the client. The client may transmit returned images according to its own policy.
+An AI client with local shell access can run the commands directly. To use MCP, register `Grabby.exe` as a local stdio server with `mcp` as its argument. No cloud connector or network listener is required by Grabby. MCP tools are `list_windows`, `set_output_directory`, `capture_window`, and `capture_window_by_title` (optional `delay_seconds`, `client_area`, `include_image`). Title matching ignores case; if several windows match, Grabby refuses to guess and asks for an exact title, PID, or HWND. `output_path` is optional, and `include_image=true` also returns the PNG to the client. The client may transmit returned images according to its own policy.
 
 For Codex CLI or its IDE extension, the registration command is:
 
@@ -37,7 +43,7 @@ codex mcp get ai_screen_grabby
 
 Replace `FULL_PATH_TO` with the extracted folder. Restart the Codex client after registration. This changes Codex's local MCP configuration; the portable app itself does not change that configuration.
 
-Grabby captures covered windows using Windows `PrintWindow`. A minimized window is briefly restored without taking focus, captured, then minimized again. Some GPU-rendered or protected apps can still return blank or incomplete images. Inspect the saved PNG before treating it as evidence.
+Grabby captures covered windows using Windows `PrintWindow` with full-content rendering, so browser-based and GPU-rendered apps (WebView2, Electron, Chrome, Edge) work too. A minimized window is briefly restored without taking focus, captured, then minimized again. Protected content (for example DRM video) can still come out as one plain colour; the JSON result then says `"blank": true`. Inspect the saved PNG before treating it as evidence.
 
 Only a synthetic interface screenshot is included in this package. No user window captures are included. Grabby does not upload captures.
 
